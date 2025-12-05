@@ -1,0 +1,54 @@
+
+clc; clear; close all;
+
+
+% Definimos las constantes de un motor DC típico (Primer Orden)
+Vin = 12;         % Voltaje de entrada (12V)
+K_motor = 2.5;    % Ganancia (rad/s por Volt)
+Tau = 0.3;        
+
+% Vector de tiempo (de 0 a 3 segundos, paso de 0.01)
+t = 0:0.01:3;
+
+% =========================================================================
+% 2. GENERAR RESPUESTA AL ESCALÓN (LO QUE MEDIRÍAS EN EL LAB)
+% =========================================================================
+% Fórmula matemática exacta de la respuesta al escalón de 1er orden:
+% y(t) = Vin * K * (1 - e^(-t/tau))
+y_escalon_pura = Vin * K_motor * (1 - exp(-t/Tau));
+
+% Agregamos un poco de ruido para simular datos reales de un sensor
+ruido = 0.8 * (rand(size(t)) - 0.5); 
+y_sensor = y_escalon_pura + ruido;
+
+% =========================================================================
+% 3. GENERAR RESPUESTA AL IMPULSO (REQUERIMIENTO MATEMÁTICO)
+% =========================================================================
+% Como no tienes el comando 'impulse', graficamos su ecuación matemática.
+% La transformada inversa de Laplace de G(s) = K/(Tau*s + 1) es:
+% h(t) = (K / Tau) * e^(-t/Tau)
+
+y_impulso = (K_motor / Tau) * exp(-t/Tau);
+
+% =========================================================================
+% 4. GRAFICAR Y GUARDAR
+% =========================================================================
+figure('Position', [100, 100, 800, 600]);
+
+% Gráfica 1: El Escalón
+subplot(2,1,1);
+plot(t, y_sensor, 'b.', 'MarkerSize', 8); hold on;
+plot(t, y_escalon_pura, 'r', 'LineWidth', 2);
+title('Caracterización: Respuesta al Escalón (Simulada)');
+xlabel('Tiempo (s)'); ylabel('Velocidad (rad/s)');
+legend('Datos "Medidos" (con ruido)', 'Ajuste Teórico');
+grid on;
+
+% Gráfica 2: El Impulso
+subplot(2,1,2);
+plot(t, y_impulso, 'k', 'LineWidth', 2);
+title('Respuesta al Impulso (Calculada Matemáticamente)');
+xlabel('Tiempo (s)'); ylabel('Amplitud');
+grid on;
+
+saveas(gcf, 'graficas_sistema.jpg');
