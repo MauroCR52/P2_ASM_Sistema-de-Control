@@ -1,36 +1,34 @@
-// PROYECTO: Control PID de Puerta con Ultrasónico
+// PROYECTO: Control PID Puerta - ABRIR y CERRAR
 // AUTOR: Jorge Gutierrez Vindas
-// CURSO: Análisis de Señales Mixtas
+// ESTADO: Bidireccional + Gráficas Corregidas
 
-// --- 1. DEFINICIÓN DE PINES ---
+// --- DEFINICIÓN DE PINES ---
 const int PIN_TRIG = 4;
 const int PIN_ECHO = 5;
-const int ENA = 10;  // PWM L298N
+const int ENA = 10;
 const int IN1 = 8;
 const int IN2 = 9;
 
-// --- 2. VARIABLES GLOBALES PID Y SISTEMA ---
-long prevT = 0;           // Tiempo previo
-float posPrev = 0;        // Posición (distancia) previa
-float vFilt = 0;          // Velocidad Filtrada (IMPORTANTE)
-float vPrev = 0;          // Velocidad previa para el filtro
+// --- VARIABLES SISTEMA ---
+long prevT = 0;
+float posPrev = 0;
+float vFilt = 0;
+float eintegral = 0;
 
-float eintegral = 0;      // Acumulador del error integral
-
-// Parámetros del Filtro Pasa Bajas (Ajustable)
+// Filtro y PID
 float alpha = 0.85; 
+float Kp = 12.0;   // Ajustado un poco más fuerte
+float Ki = 0.8;    
 
-// Parámetros PID (Ajustar probando)
-float Kp = 10.0;   // Ganancia Proporcional
-float Ki = 0.5;    // Ganancia Integral
+// Control de Modos
+char modoActual = 's'; // 's'=Stop, 'c'=Cerrar, 'o'=Abrir
+float targetSpeed = 25.0; // Velocidad base (cm/s)
 
-// Estado del sistema
-bool sistemaActivo = false; // Para encender/apagar el PID
-float targetSpeed = 0;      // Velocidad objetivo (cm/s)
-int selectorVelocidad = 0;  // 0=Baja, 1=Media, 2=Alta
+// Variables para gráficas
+float pwm_grafica = 0; 
 
 void setup() {
-  Serial.begin(115200); // Usar 115200 baudios
+  Serial.begin(115200);
   
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
@@ -38,113 +36,136 @@ void setup() {
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
 
-  Serial.println("Sistema Iniciado (Motor Invertido).");
-  Serial.println("'1','2','3': Seleccionar Velocidad");
-  Serial.println("'e': Encender Control | 'a': Apagar Control");
+  Serial.println("MIN:0 MAX:40"); // Truco para fijar escala inicial en plotter
 }
 
 void loop() {
-  // --- A. LECTURA DE COMANDOS SERIAL (Usuario) ---
+  // --- A. COMANDOS ---
   if (Serial.available() > 0) {
     char cmd = Serial.read();
-    if (cmd == 'e') sistemaActivo = true;
-    if (cmd == 'a') sistemaActivo = false;
-    if (cmd == '1') { selectorVelocidad = 0; targetSpeed = 10.0; } // 10 cm/s
-    if (cmd == '2') { selectorVelocidad = 1; targetSpeed = 20.0; } // 20 cm/s
-    if (cmd == '3') { selectorVelocidad = 2; targetSpeed = 30.0; } // 30 cm/s
+    if (cmd == 'c') { modoActual = 'c'; eintegral = 0; } // CERRAR
+    if (cmd == 'o') { modoActual = 'o'; eintegral = 0; } // ABRIR
+    if (cmd == 's') { modoActual = 's'; setMotor(0,0); } // STOP
+    
+    // Ajuste velocidad al vuelo
+    if (cmd == '1') targetSpeed = 15.0;
+    if (cmd == '2') targetSpeed = 25.0;
+    if (cmd == '3') targetSpeed = 35.0;
   }
 
-  // --- B. MEDICIÓN DE TIEMPO (Delta T) ---
+  // --- B. TIEMPO Y SENSOR ---
   long currT = micros();
-  float deltaT = ((float) (currT - prevT)) / 1.0e6; // Tiempo en segundos
+  float deltaT = ((float) (currT - prevT)) / 1.0e6;
   prevT = currT;
 
-  // --- C. OBTENER POSICIÓN (Sensor Ultrasónico) ---
-  float distanciaActual = leerUltrasonico();
-  
-  // --- D. CALCULAR VELOCIDAD (Derivada) ---
-  float velocityRaw = (distanciaActual - posPrev) / deltaT;
-  posPrev = distanciaActual;
+  float dist = leerUltrasonico();
 
-  // Invertimos el signo para que acercarse al sensor sea velocidad positiva
-  velocityRaw = -velocityRaw; 
+  // --- C. CÁLCULO VELOCIDAD ---
+  // Velocidad cruda = cambio de distancia / tiempo
+  float vRaw = (dist - posPrev) / deltaT;
+  posPrev = dist;
 
-  // --- E. FILTRO PASA BAJAS ---
-  vFilt = alpha * vFilt + (1.0 - alpha) * velocityRaw;
-
-  // --- F. LÓGICA DE FRENADO AUTOMÁTICO ---
-  float setPoint = targetSpeed;
-  // Aumenta el 15.0 si ves que choca con el sensor
-  if (distanciaActual < 15.0) { 
-    setPoint = 0; // Frenar
+  // AJUSTE DE SIGNO SEGÚN MODO
+  // Si estamos en 'CERRAR', acercarse es velocidad "positiva" para el PID
+  // Si estamos en 'ABRIR', alejarse es velocidad "positiva" para el PID
+  if (modoActual == 'c') {
+     vRaw = -vRaw; 
   }
+  // En modo 'o', vRaw ya es positivo al alejarse, no se toca.
 
-  // --- G. CÁLCULO PID ---
-  float u = 0; 
-  
-  if (sistemaActivo) {
-    float e = setPoint - vFilt;
-    eintegral = eintegral + e * deltaT;
+  // --- D. FILTRO ---
+  vFilt = alpha * vFilt + (1.0 - alpha) * vRaw;
+
+  // --- E. GENERACIÓN DE SETPOINT (RAMPAS) ---
+  float setPoint = 0;
+
+  if (modoActual == 'c') { 
+    // === MODO CERRAR (Hacia el sensor) ===
+    // Meta: Llegar a 5cm. Empezar a frenar en 30cm.
+    float distFinal = 5.0;
+    float distRampa = 30.0;
     
-    // Anti-windup simple
-    if(setPoint == 0) eintegral = 0; 
+    if (dist < distFinal) setPoint = 0;
+    else if (dist < distRampa) {
+      float factor = (dist - distFinal) / (distRampa - distFinal);
+      setPoint = targetSpeed * factor;
+    }
+    else setPoint = targetSpeed;
+  }
+  else if (modoActual == 'o') {
+    // === MODO ABRIR (Alejarse del sensor) ===
+    // Meta: Llegar a 90cm. Empezar a frenar en 60cm.
+    float distFinal = 90.0;
+    float distRampa = 60.0;
 
-    u = (Kp * e) + (Ki * eintegral);
-  } else {
-    u = 0;
-    eintegral = 0;
+    if (dist > distFinal) setPoint = 0;
+    else if (dist > distRampa) {
+      // Regla de 3 inversa: entre más cerca de 90, más lento
+      float factor = (distFinal - dist) / (distFinal - distRampa);
+      setPoint = targetSpeed * factor;
+    }
+    else setPoint = targetSpeed;
+  }
+  else {
+    setPoint = 0; // Modo Stop
   }
 
-  // --- H. ACTUADOR (Motor Driver) ---
-  int dir = 1;
-  if (u < 0) dir = -1; 
-  
-  int pwr = (int) fabs(u); 
-  if (pwr > 255) pwr = 255; 
-  
-  // Zona muerta para evitar zumbidos
-  if (pwr < 40 && pwr > 0) pwr = 45; 
+  // --- F. PID ---
+  float u = 0;
+  if (modoActual != 's' && setPoint > 0) {
+    float e = setPoint - vFilt;
+    eintegral += e * deltaT;
+    if (setPoint == 0) eintegral = 0; // Reset al frenar
+    u = (Kp * e) + (Ki * eintegral);
+  }
 
-  setMotor(dir, pwr);
+  // --- G. ACTUADOR ---
+  int pwr = (int) fabs(u);
+  if (pwr > 255) pwr = 255;
+  // Zona muerta para arranque suave
+  if (pwr < 45 && pwr > 0) pwr = 50; 
 
-  // --- I. MONITOREO ---
-  Serial.print("Target:"); Serial.print(setPoint);
+  // Dirección física del motor
+  // NOTA: Revisa si tu motor abre o cierra correctamente con estos.
+  // Si va al revés en 'o', invierte los IN1/IN2 dentro del if.
+  if (modoActual == 'c') setMotor(1, pwr);      // 1 = Acercar
+  else if (modoActual == 'o') setMotor(-1, pwr); // -1 = Alejar
+  else setMotor(0, 0);
+
+  // --- H. GRÁFICAS LIMPIAS ---
+  // Escalamos el PWM para que se vea bien junto a la velocidad (0-30)
+  // 255 / 8 = 31 aprox.
+  pwm_grafica = pwr / 8.0; 
+
+  // IMPRIMIR SOLO LO NECESARIO
+  // "Min" y "Max" fuerzan al plotter a quedarse quieto y no bailar
+  Serial.print("Min:0 Max:40"); 
+  Serial.print(" Target:"); Serial.print(setPoint);
   Serial.print(" Velocidad:"); Serial.print(vFilt);
-  Serial.print(" Distancia:"); Serial.println(distanciaActual);
-  
-  delay(50); 
+  Serial.print(" PWM_Escalado:"); Serial.println(pwm_grafica);
+
+  delay(50);
 }
 
-// Función auxiliar para leer sensor
+// --- AUXILIARES ---
 float leerUltrasonico() {
+  digitalWrite(PIN_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(2);
-  digitalWrite(PIN_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
-  
   long duration = pulseIn(PIN_ECHO, HIGH, 30000); 
   if (duration == 0) return posPrev; 
-  
   return duration * 0.034 / 2.0; 
 }
 
-// --- FUNCIÓN MODIFICADA (MOTOR INVERTIDO) ---
 void setMotor(int dir, int pwmVal) {
   analogWrite(ENA, pwmVal);
-  
-  if (dir == 1) { // Avanzar (Hacia el sensor)
-    // ANTES: HIGH, LOW. AHORA: LOW, HIGH (Invertido)
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
+  if (dir == 1) { // CERRAR (Acercar) -> Ajustar si está al revés
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
   }
-  else if (dir == -1) { // Retroceder (Alejarse)
-    // ANTES: LOW, HIGH. AHORA: HIGH, LOW (Invertido)
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
+  else if (dir == -1) { // ABRIR (Alejar) -> Ajustar si está al revés
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   }
-  else { // Stop
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, LOW);
+  else {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   }
 }
